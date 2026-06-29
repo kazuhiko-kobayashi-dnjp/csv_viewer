@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Rust build artifacts
+csv_viewer_rs/target/
+
+# 別プロジェクト(独立リポジトリ)なので除外
+csv_viewer_rs/
+
+# Data / samples (大きい・機密の可能性)
+sample.csv
+*.csv
+*:Zone.Identifier
+*:sec.endpointdlp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
