@@ -1,8 +1,10 @@
 """軽量CSVビューワ (Canvas仮想スクロール版)
 
 特徴:
+- 複数ファイルをタブで表示
 - 行番号列 + 列ヘッダ表示
-- Excelライクな矩形セル選択（ドラッグ）
+- Excelライクな矩形セル選択（ドラッグ / Shift+矢印 / Ctrl+Shift+矢印で端まで一括）
+- ヘッダ(ラベル名)も選択してコピー可能
 - 2段ヘッダ: 接頭語(ドット前)を共通列でまとめて上段に、個別名(ドット後)を下段に表示
 - 巨大CSV対応: 行オフセットをバックグラウンドで索引し、表示中の行だけ読む仮想スクロール
 - 先頭行(ヘッダ)と先頭列(行番号)を固定
@@ -66,88 +68,102 @@ def to_local_path(path):
     return path
 
 
-class CSVViewer:
-    def __init__(self, root, filepath=None):
-        self.root = root
-        root.title("CSV Viewer")
-        root.geometry("1200x700")
+def parse_drop(data):
+    """tkinterdnd2 の Drop データから複数パスを取り出す。"""
+    paths = []
+    s = data.strip()
+    i = 0
+    while i < len(s):
+        if s[i] == "{":
+            j = s.find("}", i)
+            if j == -1:
+                paths.append(s[i + 1:])
+                break
+            paths.append(s[i + 1:j])
+            i = j + 1
+            while i < len(s) and s[i] == " ":
+                i += 1
+        else:
+            j = s.find(" ", i)
+            if j == -1:
+                paths.append(s[i:])
+                break
+            paths.append(s[i:j])
+            i = j + 1
+    return [to_local_path(p) for p in paths if p.strip()]
+
+
+class Grid(ttk.Frame):
+    """1ファイル分の表示・操作を担当するウィジェット。"""
+
+    def __init__(self, parent, set_status, open_in_new_tab):
+        super().__init__(parent)
+        self.set_status = set_status
+        self.open_in_new_tab = open_in_new_tab
 
         self._filepath = None
         self._encoding = "utf-8"
-        self._headers = []          # 列名リスト
-        self._prefixes = []         # 各列の接頭語
-        self._indivs = []           # 各列の個別名
-        self._col_w = []            # 各列の幅
-        self._col_x = []            # 各列の左端x(データ座標, 累積)
-        self._total_w = 0           # データ列の総幅
+        self._headers = []
+        self._prefixes = []
+        self._indivs = []
+        self._col_w = []
+        self._col_x = []
+        self._total_w = 0
 
-        self._offsets = [0]         # 各データ行の開始バイトオフセット (索引)
-        self._total_rows = 0        # 索引済みデータ行数
+        self._offsets = [0]
+        self._total_rows = 0
         self._indexing = False
+        self._pending = None
+        self._index_error = None
 
-        self._row_cache = {}        # row_idx -> list[str]
+        self._row_cache = {}
         self._cache_order = []
 
-        self._first_row = 0         # 表示先頭データ行
-        self._x_off = 0             # 水平スクロール(px, データ座標)
+        self._first_row = 0
+        self._x_off = 0
 
-        # 選択範囲 (データ座標: r0,c0 - r1,c1)
+        # セル選択 (r0,c0)=アンカー (r1,c1)=アクティブ端
         self._sel = None
-        self._dragging = False
+        # ヘッダ(ラベル)選択 (c0, c1)
+        self._hsel = None
+        self._dragging = None      # "cell" | "header" | None
+
+        self._search_result = None
+        self._search_term = ""
 
         self._build_ui()
         self._setup_dnd()
-        if filepath:
-            root.after(100, lambda: self._open_file(filepath))
 
     # ── UI ────────────────────────────────────────────────────────
     def _build_ui(self):
-        toolbar = tk.Frame(self.root, bd=1, relief=tk.RAISED)
-        toolbar.pack(side=tk.TOP, fill=tk.X)
-        tk.Button(toolbar, text="Open CSV", command=self._browse).pack(side=tk.LEFT, padx=4, pady=2)
-        tk.Button(toolbar, text="Copy", command=self._copy_selection).pack(side=tk.LEFT, padx=4, pady=2)
-
-        tk.Label(toolbar, text="検索:").pack(side=tk.LEFT, padx=(12, 2))
-        self._search_var = tk.StringVar()
-        ent = tk.Entry(toolbar, textvariable=self._search_var, width=20)
-        ent.pack(side=tk.LEFT, padx=2)
-        ent.bind("<Return>", lambda e: self._search(1))
-        ent.bind("<Shift-Return>", lambda e: self._search(-1))
-        tk.Button(toolbar, text="\u25b2", width=2,
-                  command=lambda: self._search(-1)).pack(side=tk.LEFT)
-        tk.Button(toolbar, text="\u25bc", width=2,
-                  command=lambda: self._search(1)).pack(side=tk.LEFT, padx=(0, 6))
-
-        self._status = tk.StringVar(value="No file loaded")
-        tk.Label(toolbar, textvariable=self._status, anchor=tk.W).pack(side=tk.LEFT, padx=8)
-
-        container = tk.Frame(self.root)
-        container.pack(fill=tk.BOTH, expand=True)
-
-        self._canvas = tk.Canvas(container, bg="white", highlightthickness=0)
-        self._vsb = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self._on_vscroll)
-        self._hsb = ttk.Scrollbar(container, orient=tk.HORIZONTAL, command=self._on_hscroll)
+        self._canvas = tk.Canvas(self, bg="white", highlightthickness=0)
+        self._vsb = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self._on_vscroll)
+        self._hsb = ttk.Scrollbar(self, orient=tk.HORIZONTAL, command=self._on_hscroll)
         self._canvas.grid(row=0, column=0, sticky="nsew")
         self._vsb.grid(row=0, column=1, sticky="ns")
         self._hsb.grid(row=1, column=0, sticky="ew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
 
-        self._canvas.bind("<Configure>", lambda e: self._redraw())
-        self._canvas.bind("<MouseWheel>", self._on_wheel)
-        self._canvas.bind("<Button-4>", self._on_wheel)
-        self._canvas.bind("<Button-5>", self._on_wheel)
-        self._canvas.bind("<Shift-MouseWheel>", self._on_wheel_h)
-        self._canvas.bind("<Button-1>", self._on_press)
-        self._canvas.bind("<B1-Motion>", self._on_drag)
-        self._canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.root.bind("<Control-c>", lambda e: self._copy_selection())
+        cv = self._canvas
+        cv.bind("<Configure>", lambda e: self._redraw())
+        cv.bind("<MouseWheel>", self._on_wheel)
+        cv.bind("<Button-4>", self._on_wheel)
+        cv.bind("<Button-5>", self._on_wheel)
+        cv.bind("<Shift-MouseWheel>", self._on_wheel_h)
+        cv.bind("<Button-1>", self._on_press)
+        cv.bind("<B1-Motion>", self._on_drag)
+        cv.bind("<ButtonRelease-1>", self._on_release)
+        cv.bind("<Control-c>", lambda e: self.copy_selection())
+        cv.bind("<Control-C>", lambda e: self.copy_selection())
+        # 矢印: 単独移動 / Shift: 範囲拡張 / Ctrl+Shift: 端まで拡張
         for key, dr, dc in (("Up", -1, 0), ("Down", 1, 0),
                             ("Left", 0, -1), ("Right", 0, 1)):
-            self._canvas.bind(f"<{key}>",
-                              lambda e, a=dr, b=dc: self._move_sel(a, b))
-        self._canvas.bind("<Prior>", lambda e: self._page(-1))
-        self._canvas.bind("<Next>", lambda e: self._page(1))
+            cv.bind(f"<{key}>", lambda e, a=dr, b=dc: self._move_sel(a, b))
+            cv.bind(f"<Shift-{key}>", lambda e, a=dr, b=dc: self._extend_sel(a, b, False))
+            cv.bind(f"<Control-Shift-{key}>", lambda e, a=dr, b=dc: self._extend_sel(a, b, True))
+        cv.bind("<Prior>", lambda e: self._page(-1))
+        cv.bind("<Next>", lambda e: self._page(1))
 
     def _setup_dnd(self):
         try:
@@ -158,35 +174,25 @@ class CSVViewer:
             pass
 
     def _on_drop(self, event):
-        raw = event.data
-        # 複数ファイルがブレースで来る場合は先頭のみ
-        if raw.startswith("{"):
-            raw = raw[1:].split("}", 1)[0]
-        else:
-            raw = raw.split(" ")[0]
-        path = to_local_path(raw)
-        if path:
-            self._open_file(path)
+        for path in parse_drop(event.data):
+            self.open_in_new_tab(path)
 
-    def _browse(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
-        if path:
-            self._open_file(path)
+    def focus_grid(self):
+        self._canvas.focus_set()
 
     # ── ファイル読込 ─────────────────────────────────────────────
-    def _open_file(self, path):
+    def open_file(self, path):
         try:
             enc = self._detect_encoding(path)
             with open(path, "r", encoding=enc, newline="") as f:
                 header_line = f.readline()
             if not header_line:
                 messagebox.showerror("Error", "空のファイルです")
-                return
+                return False
             headers = next(csv.reader([header_line]))
         except Exception as e:
             messagebox.showerror("Error", f"読込失敗: {e}")
-            return
+            return False
 
         self._filepath = path
         self._encoding = enc
@@ -206,9 +212,15 @@ class CSVViewer:
         self._first_row = 0
         self._x_off = 0
         self._sel = None
+        self._hsel = None
 
-        self._status.set(f"{path}  ({len(headers)} cols)  索引中…")
+        self._set_status(f"{path}  ({len(headers)} cols)  索引中…")
         self._start_indexing(path, enc, len(header_line.encode(enc)))
+        return True
+
+    def _set_status(self, text):
+        # 自分が現在のタブのときのみステータス更新
+        self.set_status(self, text)
 
     def _detect_encoding(self, path):
         with open(path, "rb") as f:
@@ -238,7 +250,7 @@ class CSVViewer:
 
     def _start_indexing(self, path, enc, header_bytes):
         self._indexing = True
-        self._pending = None          # worker -> main 受け渡し
+        self._pending = None
         self._index_error = None
 
         def worker():
@@ -257,11 +269,11 @@ class CSVViewer:
                 self._index_error = str(e)
 
         threading.Thread(target=worker, daemon=True).start()
-        self.root.after(100, self._poll_index)
+        self.after(100, self._poll_index)
 
     def _poll_index(self):
         if self._index_error is not None:
-            self._status.set(f"\u7d22\u5f15\u30a8\u30e9\u30fc: {self._index_error}")
+            self._set_status(f"索引エラー: {self._index_error}")
             self._indexing = False
             return
         if self._pending is not None:
@@ -271,15 +283,14 @@ class CSVViewer:
             self._total_rows = len(offsets)
             if done:
                 self._indexing = False
-                self._status.set(
-                    f"{self._filepath}  {self._total_rows} rows \u00d7 {len(self._headers)} cols")
+                self._set_status(
+                    f"{self._filepath}  {self._total_rows} rows × {len(self._headers)} cols")
                 self._redraw()
                 return
-            self._status.set(
-                f"{self._filepath}  \u7d22\u5f15\u4e2d\u2026 {self._total_rows} rows")
+            self._set_status(f"{self._filepath}  索引中… {self._total_rows} rows")
             self._redraw()
         if self._indexing:
-            self.root.after(100, self._poll_index)
+            self.after(100, self._poll_index)
 
     # ── 行データ取得 ─────────────────────────────────────────────
     def _get_row(self, idx):
@@ -311,8 +322,7 @@ class CSVViewer:
         if not self._total_rows:
             return
         if args[0] == "moveto":
-            frac = float(args[1])
-            self._first_row = int(frac * self._total_rows)
+            self._first_row = int(float(args[1]) * self._total_rows)
         elif args[0] == "scroll":
             n = int(args[1])
             if args[2] == "pages":
@@ -323,8 +333,7 @@ class CSVViewer:
 
     def _on_hscroll(self, *args):
         if args[0] == "moveto":
-            frac = float(args[1])
-            self._x_off = int(frac * self._total_w)
+            self._x_off = int(float(args[1]) * self._total_w)
         elif args[0] == "scroll":
             self._x_off += int(args[1]) * 40
         self._clamp_scroll()
@@ -342,8 +351,7 @@ class CSVViewer:
         self._redraw()
 
     def _on_wheel_h(self, event):
-        delta = -int(event.delta / 120) * 40
-        self._x_off += delta
+        self._x_off += -int(event.delta / 120) * 40
         self._clamp_scroll()
         self._redraw()
 
@@ -356,7 +364,6 @@ class CSVViewer:
 
     # ── 座標変換 ─────────────────────────────────────────────────
     def _col_at_x(self, px):
-        """キャンバスx(px) -> データ列index または None。"""
         if px < ROWNUM_W:
             return None
         data_x = px - ROWNUM_W + self._x_off
@@ -386,17 +393,36 @@ class CSVViewer:
 
     # ── 選択 ─────────────────────────────────────────────────────
     def _on_press(self, event):
+        self._canvas.focus_set()
+        if event.y < HEADER_ROWS * ROW_H:
+            # ヘッダ(ラベル)選択
+            c = self._col_at_x(event.x)
+            if c is None:
+                return
+            self._hsel = (c, c)
+            self._sel = None
+            self._dragging = "header"
+            self._redraw()
+            return
         c = self._col_at_x(event.x)
         r = self._row_at_y(event.y)
         if c is None or r is None:
             return
         self._sel = (r, c, r, c)
-        self._dragging = True
-        self._canvas.focus_set()
+        self._hsel = None
+        self._dragging = "cell"
         self._redraw()
 
     def _on_drag(self, event):
-        if not self._dragging or self._sel is None:
+        if self._dragging == "header":
+            cx = max(ROWNUM_W, min(event.x, self._canvas.winfo_width() - 1))
+            c = self._col_at_x(cx)
+            if c is None:
+                c = self._hsel[1]
+            self._hsel = (self._hsel[0], c)
+            self._redraw()
+            return
+        if self._dragging != "cell" or self._sel is None:
             return
         if event.y > self._canvas.winfo_height() - ROW_H:
             self._first_row += 1
@@ -415,24 +441,50 @@ class CSVViewer:
         self._redraw()
 
     def _on_release(self, event):
-        self._dragging = False
+        self._dragging = None
 
     def _norm_sel(self):
         r0, c0, r1, c1 = self._sel
         return min(r0, r1), min(c0, c1), max(r0, r1), max(c0, c1)
 
-    def _copy_selection(self):
+    def copy_selection(self):
+        # ヘッダ選択が優先（ラベル名コピー）
+        if self._hsel is not None:
+            c0, c1 = min(self._hsel), max(self._hsel)
+            labels = [self._headers[c] for c in range(c0, c1 + 1)]
+            self._to_clipboard("\t".join(labels))
+            self._set_status(f"ラベル {c1 - c0 + 1} 列をコピーしました")
+            return "break"
         if not self._sel:
-            return
+            return "break"
         r0, c0, r1, c1 = self._norm_sel()
         lines = []
         for r in range(r0, r1 + 1):
             row = self._get_row(r) or []
             cells = [row[c] if c < len(row) else "" for c in range(c0, c1 + 1)]
             lines.append("\t".join(cells))
-        text = "\n".join(lines)
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
+        self._to_clipboard("\n".join(lines))
+        self._set_status(f"{r1 - r0 + 1}行 × {c1 - c0 + 1}列をコピーしました")
+        return "break"
+
+    def copy_with_labels(self):
+        """選択範囲を、対象列のラベル名を1行目に付けてコピー。"""
+        if self._hsel is not None:
+            return self.copy_selection()
+        if not self._sel:
+            return "break"
+        r0, c0, r1, c1 = self._norm_sel()
+        lines = ["\t".join(self._headers[c] for c in range(c0, c1 + 1))]
+        for r in range(r0, r1 + 1):
+            row = self._get_row(r) or []
+            lines.append("\t".join(row[c] if c < len(row) else "" for c in range(c0, c1 + 1)))
+        self._to_clipboard("\n".join(lines))
+        self._set_status(f"ラベル付きで {r1 - r0 + 1}行をコピーしました")
+        return "break"
+
+    def _to_clipboard(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
 
     # ── キーボード移動 ───────────────────────────────────────────
     def _move_sel(self, dr, dc):
@@ -445,13 +497,37 @@ class CSVViewer:
         r = max(0, min(r + dr, self._total_rows - 1))
         c = max(0, min(c + dc, len(self._headers) - 1))
         self._sel = (r, c, r, c)
+        self._hsel = None
         self._ensure_visible(r, c)
         self._redraw()
         return "break"
 
+    def _extend_sel(self, dr, dc, jump):
+        if not self._headers or not self._total_rows:
+            return "break"
+        if self._sel is None:
+            self._sel = (self._first_row, 0, self._first_row, 0)
+        r0, c0, r1, c1 = self._sel
+        if jump:
+            if dr < 0:
+                r1 = 0
+            elif dr > 0:
+                r1 = self._total_rows - 1
+            if dc < 0:
+                c1 = 0
+            elif dc > 0:
+                c1 = len(self._headers) - 1
+        else:
+            r1 = max(0, min(r1 + dr, self._total_rows - 1))
+            c1 = max(0, min(c1 + dc, len(self._headers) - 1))
+        self._sel = (r0, c0, r1, c1)
+        self._hsel = None
+        self._ensure_visible(r1, c1)
+        self._redraw()
+        return "break"
+
     def _page(self, direction):
-        n = self._visible_data_rows()
-        self._first_row += direction * n
+        self._first_row += direction * self._visible_data_rows()
         self._clamp_scroll()
         self._redraw()
         return "break"
@@ -462,7 +538,6 @@ class CSVViewer:
             self._first_row = r
         elif r >= self._first_row + n_vis:
             self._first_row = r - n_vis + 1
-        # 水平
         x0 = self._col_x[c]
         x1 = x0 + self._col_w[c]
         avail = self._canvas.winfo_width() - ROWNUM_W
@@ -473,11 +548,10 @@ class CSVViewer:
         self._clamp_scroll()
 
     # ── 検索 ─────────────────────────────────────────────────────
-    def _search(self, direction):
-        term = self._search_var.get().strip()
+    def search(self, term, direction):
+        term = term.strip()
         if not term or not self._total_rows:
-            return "break"
-        # 空白区切りの複数キーワードをすべて含めばヒット(AND、部分一致、大小無視)
+            return
         terms = [t.lower() for t in term.split() if t]
         if self._sel:
             _, _, sr, sc = self._sel
@@ -488,7 +562,6 @@ class CSVViewer:
         enc = self._encoding
         offsets = self._offsets
         total = self._total_rows
-        # 列名(ラベル)も検索対象に含める
         header_lower = [h.lower() for h in self._headers]
 
         def read_row(i):
@@ -507,27 +580,25 @@ class CSVViewer:
             while rows_scanned <= total:
                 row = read_row(r)
                 lowered = [v.lower() for v in row]
-                # 各列の検索対象テキスト = セル値 + 列ラベル
+
                 def text_at(cc):
                     cell = lowered[cc] if cc < len(lowered) else ""
                     label = header_lower[cc] if cc < len(header_lower) else ""
                     return cell + " " + label
+
                 if single:
-                    # 同一行内をセル単位で走査
                     cols = range(c + 1, ncol) if direction > 0 else range(c - 1, -1, -1)
                     for cc in cols:
                         if terms[0] in text_at(cc):
                             self._search_result = (r, cc)
                             return
                 else:
-                    # 複数キーワードは「行内のどこかに全部あれば」ヒット
                     texts = [text_at(cc) for cc in range(ncol)]
                     if all(any(t in tx for tx in texts) for t in terms):
                         for cc in range(ncol):
                             if any(t in texts[cc] for t in terms):
                                 self._search_result = (r, cc)
                                 return
-                # 次の行へ
                 r += direction
                 if r < 0:
                     r = total - 1
@@ -539,26 +610,25 @@ class CSVViewer:
 
         self._search_result = None
         self._search_term = term
-        self._status.set(f"\u691c\u7d22\u4e2d: {term}")
+        self._set_status(f"検索中: {term}")
         threading.Thread(target=thread, daemon=True).start()
-        self.root.after(50, self._poll_search)
-        return "break"
+        self.after(50, self._poll_search)
 
     def _poll_search(self):
-        res = getattr(self, "_search_result", None)
+        res = self._search_result
         if res is None:
-            self.root.after(50, self._poll_search)
+            self.after(50, self._poll_search)
             return
         if res == "notfound":
-            self._status.set(f"\u300c{self._search_term}\u300d\u306f\u898b\u3064\u304b\u308a\u307e\u305b\u3093")
+            self._set_status(f"「{self._search_term}」は見つかりません")
             return
         self._goto_match(res[0], res[1])
 
-
     def _goto_match(self, r, c):
         self._sel = (r, c, r, c)
+        self._hsel = None
         self._ensure_visible(r, c)
-        self._status.set(f"\u4e00\u81f4: \u884c{r + 1} \u5217{c + 1} ({self._headers[c]})")
+        self._set_status(f"一致: 行{r + 1} 列{c + 1} ({self._headers[c]})")
         self._canvas.focus_set()
         self._redraw()
 
@@ -567,7 +637,8 @@ class CSVViewer:
         cv = self._canvas
         cv.delete("all")
         if not self._headers:
-            cv.create_text(20, 20, anchor="nw", text="CSVファイルを開いてください",
+            cv.create_text(20, 20, anchor="nw",
+                           text="CSVファイルを開いてください（Open CSV / ドラッグ&ドロップ）",
                            fill="gray", font=FONT)
             return
 
@@ -643,12 +714,17 @@ class CSVViewer:
     def _draw_header(self, cv, first_col, last_col, W):
         cv.create_rectangle(ROWNUM_W, 0, W, HEADER_ROWS * ROW_H,
                             fill="#d9d9d9", outline="")
+        hsel0 = hsel1 = None
+        if self._hsel is not None:
+            hsel0, hsel1 = min(self._hsel), max(self._hsel)
         # 下段: 個別名
         for c in range(first_col, last_col + 1):
             x0 = ROWNUM_W + self._col_x[c] - self._x_off
             x1 = x0 + self._col_w[c]
+            selected = hsel0 is not None and hsel0 <= c <= hsel1
             cv.create_rectangle(x0, ROW_H, x1, HEADER_ROWS * ROW_H,
-                                fill="#e9e9e9", outline="#b0b0b0")
+                                fill="#9cc4f4" if selected else "#e9e9e9",
+                                outline="#b0b0b0")
             cv.create_text((x0 + x1) // 2, ROW_H + ROW_H // 2,
                            text=self._indivs[c], font=FONT, fill="black")
         # 上段: 接頭語を連続する同一接頭語でまとめる
@@ -661,13 +737,26 @@ class CSVViewer:
             x0 = ROWNUM_W + self._col_x[c] - self._x_off
             x1 = ROWNUM_W + self._col_x[g_end] + self._col_w[g_end] - self._x_off
             x0c = max(x0, ROWNUM_W)
-            cv.create_rectangle(x0, 0, x1, ROW_H,
-                                fill="#cfd8e8" if p else "#d9d9d9",
-                                outline="#b0b0b0")
+            selected = hsel0 is not None and not (g_end < hsel0 or c > hsel1)
+            if selected:
+                fill = "#7fb0ef"
+            elif p:
+                fill = "#cfd8e8"
+            else:
+                fill = "#d9d9d9"
+            cv.create_rectangle(x0, 0, x1, ROW_H, fill=fill, outline="#b0b0b0")
             if p:
                 cv.create_text((x0c + x1) // 2, ROW_H // 2, text=p,
                                font=FONT, fill="#103060")
             c = g_end + 1
+        # ヘッダ選択の枠
+        if hsel0 is not None and not (hsel1 < first_col or hsel0 > last_col):
+            cc0 = max(hsel0, first_col)
+            cc1 = min(hsel1, last_col)
+            bx0 = ROWNUM_W + self._col_x[cc0] - self._x_off
+            bx1 = ROWNUM_W + self._col_x[cc1] + self._col_w[cc1] - self._x_off
+            cv.create_rectangle(max(bx0, ROWNUM_W), 0, bx1, HEADER_ROWS * ROW_H,
+                                outline="#1a73e8", width=2)
         cv.create_line(ROWNUM_W, HEADER_ROWS * ROW_H, W, HEADER_ROWS * ROW_H,
                        fill="#a0a0a0")
 
@@ -718,10 +807,161 @@ class CSVViewer:
             self._hsb.set(0, 1)
 
 
+class App:
+    """ツールバー + 複数タブ(Notebook)を管理するアプリ本体。"""
+
+    def __init__(self, root, filepaths=None):
+        self.root = root
+        root.title("CSV Viewer")
+        root.geometry("1200x700")
+        self._grids = []  # 開いている Grid のリスト
+
+        self._build_ui()
+        self._setup_dnd()
+
+        if filepaths:
+            root.after(100, lambda: [self.open_file_in_new_tab(p) for p in filepaths])
+        else:
+            self._new_tab()  # 空のタブ
+
+    # ── UI ────────────────────────────────────────────────────────
+    def _build_ui(self):
+        toolbar = tk.Frame(self.root, bd=1, relief=tk.RAISED)
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        tk.Button(toolbar, text="Open CSV", command=self._browse).pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Button(toolbar, text="Copy", command=self._copy).pack(side=tk.LEFT, padx=2, pady=2)
+        tk.Button(toolbar, text="Copy+ラベル", command=self._copy_labels).pack(side=tk.LEFT, padx=2, pady=2)
+        tk.Button(toolbar, text="タブを閉じる", command=self._close_tab).pack(side=tk.LEFT, padx=2, pady=2)
+
+        tk.Label(toolbar, text="検索:").pack(side=tk.LEFT, padx=(12, 2))
+        self._search_var = tk.StringVar()
+        ent = tk.Entry(toolbar, textvariable=self._search_var, width=20)
+        ent.pack(side=tk.LEFT, padx=2)
+        ent.bind("<Return>", lambda e: self._do_search(1))
+        ent.bind("<Shift-Return>", lambda e: self._do_search(-1))
+        tk.Button(toolbar, text="▲", width=2, command=lambda: self._do_search(-1)).pack(side=tk.LEFT)
+        tk.Button(toolbar, text="▼", width=2, command=lambda: self._do_search(1)).pack(side=tk.LEFT, padx=(0, 6))
+
+        self._status = tk.StringVar(value="No file loaded")
+        tk.Label(toolbar, textvariable=self._status, anchor=tk.W).pack(side=tk.LEFT, padx=8)
+
+        self._nb = ttk.Notebook(self.root)
+        self._nb.pack(fill=tk.BOTH, expand=True)
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._nb.bind("<Button-2>", self._on_tab_middle_click)
+
+        self.root.bind("<Control-w>", lambda e: self._close_tab())
+        self.root.bind("<Control-t>", lambda e: self._new_tab())
+
+    def _setup_dnd(self):
+        # Notebook 全体でもドロップ受付（空タブ時など）
+        try:
+            from tkinterdnd2 import DND_FILES
+            self._nb.drop_target_register(DND_FILES)
+            self._nb.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            pass
+
+    def _on_drop(self, event):
+        for path in parse_drop(event.data):
+            self.open_file_in_new_tab(path)
+
+    # ── タブ管理 ─────────────────────────────────────────────────
+    def _new_tab(self, title="(empty)"):
+        grid = Grid(self._nb, set_status=self._set_status,
+                    open_in_new_tab=self.open_file_in_new_tab)
+        self._grids.append(grid)
+        self._nb.add(grid, text=title)
+        self._nb.select(grid)
+        grid.after(50, grid.focus_grid)
+        return grid
+
+    def open_file_in_new_tab(self, path):
+        cur = self._current_grid()
+        # 現在のタブが空なら再利用、そうでなければ新規タブ
+        if cur is not None and cur._filepath is None:
+            grid = cur
+        else:
+            grid = self._new_tab()
+        if grid.open_file(path):
+            self._nb.tab(grid, text=os.path.basename(path))
+            self._nb.select(grid)
+            grid.after(50, grid.focus_grid)
+
+    def _close_tab(self):
+        grid = self._current_grid()
+        if grid is None:
+            return
+        self._nb.forget(grid)
+        if grid in self._grids:
+            self._grids.remove(grid)
+        grid.destroy()
+        if not self._nb.tabs():
+            self._new_tab()
+
+    def _on_tab_middle_click(self, event):
+        try:
+            idx = self._nb.index("@%d,%d" % (event.x, event.y))
+        except Exception:
+            return
+        tab_id = self._nb.tabs()[idx]
+        widget = self.root.nametowidget(tab_id)
+        self._nb.forget(widget)
+        if widget in self._grids:
+            self._grids.remove(widget)
+        widget.destroy()
+        if not self._nb.tabs():
+            self._new_tab()
+
+    def _current_grid(self):
+        cur = self._nb.select()
+        if not cur:
+            return None
+        return self.root.nametowidget(cur)
+
+    def _on_tab_changed(self, event):
+        grid = self._current_grid()
+        if grid is not None:
+            if grid._filepath:
+                self._set_status(grid, f"{grid._filepath}  "
+                                 f"{grid._total_rows} rows × {len(grid._headers)} cols")
+            else:
+                self._status.set("No file loaded")
+            grid.after(10, grid.focus_grid)
+
+    # ── ツールバー操作の委譲 ─────────────────────────────────────
+    def _browse(self):
+        paths = filedialog.askopenfilenames(
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        for p in paths:
+            self.open_file_in_new_tab(p)
+
+    def _copy(self):
+        g = self._current_grid()
+        if g:
+            g.copy_selection()
+
+    def _copy_labels(self):
+        g = self._current_grid()
+        if g:
+            g.copy_with_labels()
+
+    def _do_search(self, direction):
+        g = self._current_grid()
+        if g:
+            g.search(self._search_var.get(), direction)
+        return "break"
+
+    def _set_status(self, grid, text):
+        # 現在表示中のタブのときのみ反映
+        if grid is self._current_grid():
+            self._status.set(text)
+
+
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else None
+    paths = [to_local_path(p) for p in sys.argv[1:]] or None
     root = _make_tk()
-    CSVViewer(root, path)
+    App(root, paths)
     root.mainloop()
 
 
