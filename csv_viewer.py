@@ -411,6 +411,7 @@ class Grid(ttk.Frame):
         self._sel = (r, c, r, c)
         self._hsel = None
         self._dragging = "cell"
+        self._update_cell_status()
         self._redraw()
 
     def _on_drag(self, event):
@@ -499,6 +500,7 @@ class Grid(ttk.Frame):
         self._sel = (r, c, r, c)
         self._hsel = None
         self._ensure_visible(r, c)
+        self._update_cell_status()
         self._redraw()
         return "break"
 
@@ -632,6 +634,13 @@ class Grid(ttk.Frame):
         self._canvas.focus_set()
         self._redraw()
 
+    def _update_cell_status(self):
+        if self._sel is None or not self._headers:
+            return
+        _, _, r, c = self._sel
+        col_name = self._headers[c] if c < len(self._headers) else ""
+        self._set_status(f"{self._filepath}  行{r + 1} 列{c + 1} ({col_name})")
+
     # ── 描画 ─────────────────────────────────────────────────────
     def _redraw(self):
         cv = self._canvas
@@ -651,6 +660,7 @@ class Grid(ttk.Frame):
         first_col, last_col = self._visible_col_range(W)
 
         if self._sel:
+            self._draw_crosshair(cv, first_col, last_col, n_vis, data_top, W, H)
             self._draw_selection(cv, first_col, last_col, n_vis, data_top)
 
         for vi in range(n_vis):
@@ -759,6 +769,19 @@ class Grid(ttk.Frame):
                                 outline="#1a73e8", width=2)
         cv.create_line(ROWNUM_W, HEADER_ROWS * ROW_H, W, HEADER_ROWS * ROW_H,
                        fill="#a0a0a0")
+
+    def _draw_crosshair(self, cv, first_col, last_col, n_vis, data_top, W, H):
+        # アクティブセル（選択の末尾）の行・列に薄い十字
+        _, _, ar, ac = self._sel
+        # 行ハイライト
+        vi = ar - self._first_row
+        if 0 <= vi < n_vis:
+            y = data_top + vi * ROW_H
+            cv.create_rectangle(ROWNUM_W, y, W, y + ROW_H, fill="#eef5ff", outline="")
+        # 列ハイライト
+        if first_col <= ac <= last_col:
+            x = ROWNUM_W + self._col_x[ac] - self._x_off
+            cv.create_rectangle(x, data_top, x + self._col_w[ac], H, fill="#eef5ff", outline="")
 
     def _draw_selection(self, cv, first_col, last_col, n_vis, data_top):
         r0, c0, r1, c1 = self._norm_sel()
