@@ -576,19 +576,17 @@ class Grid(ttk.Frame):
         self.clipboard_clear()
         self.clipboard_append(text)
 
-    def get_plot_data(self, max_rows=50000):
-        """選択列のデータを返す。
+    def get_plot_info(self):
+        """グラフウィンドウ起動に必要な情報を返す（データは読まない）。
         戻り値: {
             'headers': [全列名],
-            'sel_cols': [選択列インデックス],  # _sel or _hsel から
-            'cols': {col_idx: [float or None, ...]},  # 選択列のデータ
+            'sel_cols': [選択列インデックス],
             'total_rows': int,
-            'sampled': bool,  # max_rows でサンプリングしたか
+            'filepath': str, 'encoding': str, 'offsets': list,
         }
         """
         if not self._headers or not self._total_rows:
             return None
-        # 選択列を収集
         if self._hsel is not None:
             c0, c1 = min(self._hsel), max(self._hsel)
             sel_cols = list(range(c0, c1 + 1))
@@ -598,40 +596,13 @@ class Grid(ttk.Frame):
             sel_cols = list(range(c0, c1 + 1))
         else:
             return None
-
-        total = self._total_rows
-        sampled = total > max_rows
-        if sampled:
-            step = total / max_rows
-            indices = [int(i * step) for i in range(max_rows)]
-        else:
-            indices = list(range(total))
-
-        cols = {c: [] for c in sel_cols}
-        path, enc, offsets = self._filepath, self._encoding, self._offsets
-        import csv as _csv
-        with open(path, "r", encoding=enc, newline="") as f:
-            for idx in indices:
-                f.seek(offsets[idx])
-                line = f.readline()
-                fields = next(_csv.reader([line])) if line else []
-                for c in sel_cols:
-                    raw = fields[c] if c < len(fields) else ""
-                    try:
-                        cols[c].append(float(raw))
-                    except (ValueError, OverflowError):
-                        cols[c].append(None)
-
         return {
             "headers": self._headers,
             "sel_cols": sel_cols,
-            "cols": cols,
-            "total_rows": total,
-            "sampled": sampled,
-            "indices": indices,
-            "_filepath": self._filepath,
-            "_encoding": self._encoding,
-            "_offsets": self._offsets,
+            "total_rows": self._total_rows,
+            "filepath": self._filepath,
+            "encoding": self._encoding,
+            "offsets": self._offsets,
         }
 
     # ── キーボード移動 ───────────────────────────────────────────
@@ -1114,26 +1085,25 @@ class Grid(ttk.Frame):
 
 
 class PlotWindow:
-    """グラフ表示ポップアップ。matplotlib を Tkinter に埋め込む。"""
+    """グラフ表示ポップアップ。matplotlib を Tkinter に埋め込む。
 
-    MAX_ROWS = 50000  # サンプリング上限
+    UI フロー:
+      1. 左ペインで X軸列(1つ) と Y軸列(複数) を選択
+      2. 「描画」ボタン押下 → 1回だけファイルを読んでデータをキャッシュ → 描画
+      3. 「Y軸を分離」チェックはキャッシュ済みデータで即再描画（再読み不要）
+    """
 
-    def __init__(self, parent, data):
-        """
-        data: Grid.get_plot_data() の戻り値
-        """
-        self._data = data
-        self._win = tk.Toplevel(parent)
-        self._win.title("グラフ")
-        self._win.geometry("900x620")
+    MAX_ROWS = 50000
 
-        self._x_var = tk.StringVar(value="(行番号)")
-        self._split_var = tk.BooleanVar(value=False)
+    def __init__(self, parent, info):
+        """info: Grid.get_plot_info() の戻り値"""
+        self._info = info
+        self._cached = None   # 読み込み済みデータ {col_idx: [float|nan, ...]}
+        self._cached_x_col = None   # キャッシュ時のX列インデックス(None=行番号)
+        self._cached_y_cols = None  # キャッシュ時のY列リスト
+        self._cached_x_arr = None
+        self._cached_indices = None
 
-        self._build_ui()
-        self._plot()
-
-    def _build_ui(self):
         try:
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
             import matplotlib.pyplot as plt
@@ -1141,74 +1111,154 @@ class PlotWindow:
             self._FigureCanvasTkAgg = FigureCanvasTkAgg
             self._NavToolbar = NavigationToolbar2Tk
         except ImportError:
+            self._plt = None
+
+        self._split_var = tk.BooleanVar(value=False)
+        self._canvas_widget = None
+        self._toolbar_widget = None
+
+        self._win = tk.Toplevel(parent)
+        self._win.title("グラフ")
+        self._win.geometry("1000x660")
+        self._build_ui()
+
+    def _build_ui(self):
+        if self._plt is None:
             tk.Label(self._win, text="matplotlib が必要です: pip install matplotlib",
                      fg="red").pack(padx=20, pady=20)
             return
 
-        # ── コントロールパネル ──
-        ctrl = tk.Frame(self._win)
-        ctrl.pack(side=tk.TOP, fill=tk.X, padx=6, pady=3)
+        headers = self._info["headers"]
+        sel_cols = self._info["sel_cols"]
 
-        headers = self._data["headers"]
-        x_choices = ["(行番号)"] + headers
+        # ── 左ペイン: 軸選択 ──────────────────────────────────────
+        left = tk.Frame(self._win, width=220, bd=1, relief=tk.GROOVE)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
+        left.pack_propagate(False)
 
-        tk.Label(ctrl, text="X軸:").pack(side=tk.LEFT)
-        self._x_cb = ttk.Combobox(ctrl, textvariable=self._x_var,
-                                  values=x_choices, width=30, state="readonly")
-        self._x_cb.pack(side=tk.LEFT, padx=(2, 12))
-        self._x_cb.bind("<<ComboboxSelected>>", lambda e: self._plot())
+        tk.Label(left, text="X軸 (1列)", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=6, pady=(6, 2))
+        self._x_lb = tk.Listbox(left, height=6, exportselection=False, font=FONT)
+        xsb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self._x_lb.yview)
+        self._x_lb.config(yscrollcommand=xsb.set)
+        self._x_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        xsb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
 
-        tk.Checkbutton(ctrl, text="Y軸を分離", variable=self._split_var,
-                       command=self._plot).pack(side=tk.LEFT, padx=4)
+        tk.Label(left, text="Y軸 (複数選択可)", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=6, pady=(8, 2))
+        self._y_lb = tk.Listbox(left, selectmode=tk.EXTENDED, exportselection=False, font=FONT)
+        ysb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self._y_lb.yview)
+        self._y_lb.config(yscrollcommand=ysb.set)
+        self._y_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        ysb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
 
-        if self._data["sampled"]:
-            tk.Label(ctrl, text=f"※ {self._data['total_rows']:,}行 → {self.MAX_ROWS:,}行サンプリング",
-                     fg="#888").pack(side=tk.LEFT, padx=8)
+        # リストに全列名を投入
+        self._x_lb.insert(tk.END, "(行番号)")
+        for h in headers:
+            self._x_lb.insert(tk.END, h)
+        self._x_lb.selection_set(0)  # デフォルト: 行番号
 
-        # ── グラフ領域 ──
+        for h in headers:
+            self._y_lb.insert(tk.END, h)
+        # 選択列を初期選択
+        for c in sel_cols:
+            self._y_lb.selection_set(c)
+        if sel_cols:
+            self._y_lb.see(sel_cols[0])
+
+        # ── 下部コントロール ──────────────────────────────────────
+        btn_frame = tk.Frame(left)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=6)
+
+        tk.Checkbutton(btn_frame, text="Y軸を分離", variable=self._split_var,
+                       command=self._on_split_changed).pack(anchor="w")
+
+        self._status_lbl = tk.Label(btn_frame, text="", fg="#666", font=("TkDefaultFont", 8),
+                                    wraplength=200, justify=tk.LEFT)
+        self._status_lbl.pack(anchor="w", pady=(2, 4))
+
+        tk.Button(btn_frame, text="描画", font=("TkDefaultFont", 10, "bold"),
+                  command=self._on_draw).pack(fill=tk.X)
+
+        # ── 右ペイン: グラフ ──────────────────────────────────────
         self._fig_frame = tk.Frame(self._win)
-        self._fig_frame.pack(fill=tk.BOTH, expand=True)
-        self._canvas_widget = None
-        self._toolbar_widget = None
+        self._fig_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-    def _get_x_data(self):
-        """X軸データを (label, list[float|None]) で返す。"""
-        choice = self._x_var.get()
-        indices = self._data["indices"]
-        if choice == "(行番号)":
-            return "行番号", [i + 1 for i in indices]
-        headers = self._data["headers"]
-        if choice not in headers:
-            return "行番号", [i + 1 for i in indices]
-        col = headers.index(choice)
-        # X列が sel_cols に含まれているかに関わらず読む
-        path = None
-        # sel_cols のデータがあれば使う
-        if col in self._data["cols"]:
-            return choice, self._data["cols"][col]
-        # なければ再読み込み（X列専用）
+    def _get_selections(self):
+        """(x_col_or_None, [y_col_indices]) を返す。x_col_or_None=None は行番号。"""
+        xi = self._x_lb.curselection()
+        x_col = None if (not xi or xi[0] == 0) else xi[0] - 1  # 0番目=(行番号)
+
+        yi = self._y_lb.curselection()
+        y_cols = list(yi)  # Listbox は headers と同インデックス
+        return x_col, y_cols
+
+    def _on_draw(self):
+        x_col, y_cols = self._get_selections()
+        if not y_cols:
+            self._status_lbl.config(text="Y軸列を1つ以上選択してください")
+            return
+
+        # 必要な列セット
+        need_cols = set(y_cols)
+        if x_col is not None:
+            need_cols.add(x_col)
+
+        # キャッシュ有効チェック: 必要な列が全てキャッシュ済みか
+        if (self._cached is not None
+                and need_cols <= set(self._cached.keys())
+                and self._cached_indices is not None):
+            self._status_lbl.config(text="キャッシュ済みデータで描画")
+            self._draw(x_col, y_cols)
+            return
+
+        # ── ファイル読み込み ──
+        total = self._info["total_rows"]
+        sampled = total > self.MAX_ROWS
+        if sampled:
+            step = total / self.MAX_ROWS
+            indices = [int(i * step) for i in range(self.MAX_ROWS)]
+        else:
+            indices = list(range(total))
+
+        self._status_lbl.config(text="読み込み中…")
+        self._win.update_idletasks()
+
         import csv as _csv
-        xdata = []
+        cols = {c: [] for c in need_cols}
         try:
-            with open(self._data["_filepath"], "r",
-                      encoding=self._data["_encoding"], newline="") as f:
-                offsets = self._data["_offsets"]
-                for idx in self._data["indices"]:
+            with open(self._info["filepath"], "r",
+                      encoding=self._info["encoding"], newline="") as f:
+                offsets = self._info["offsets"]
+                for idx in indices:
                     f.seek(offsets[idx])
                     line = f.readline()
                     fields = next(_csv.reader([line])) if line else []
-                    raw = fields[col] if col < len(fields) else ""
-                    try:
-                        xdata.append(float(raw))
-                    except (ValueError, OverflowError):
-                        xdata.append(None)
-        except Exception:
-            xdata = [i + 1 for i in self._data["indices"]]
-        return choice, xdata
+                    for c in need_cols:
+                        raw = fields[c] if c < len(fields) else ""
+                        try:
+                            cols[c].append(float(raw))
+                        except (ValueError, OverflowError):
+                            cols[c].append(float("nan"))
+        except Exception as e:
+            self._status_lbl.config(text=f"読み込みエラー: {e}")
+            return
 
-    def _plot(self):
-        import matplotlib
-        matplotlib.use("TkAgg")
+        self._cached = cols
+        self._cached_indices = indices
+        n_pts = len(indices)
+        msg = f"{n_pts:,} pts"
+        if sampled:
+            msg += f"\n(全{total:,}行からサンプリング)"
+        self._status_lbl.config(text=msg)
+        self._draw(x_col, y_cols)
+
+    def _on_split_changed(self):
+        # キャッシュがあれば即再描画、なければ何もしない
+        if self._cached is not None and self._cached_y_cols is not None:
+            self._draw(self._cached_x_col, self._cached_y_cols)
+
+    def _draw(self, x_col, y_cols):
+        self._cached_x_col = x_col
+        self._cached_y_cols = y_cols
 
         # 既存ウィジェット破棄
         if self._canvas_widget:
@@ -1216,43 +1266,36 @@ class PlotWindow:
         if self._toolbar_widget:
             self._toolbar_widget.destroy()
 
-        x_label, x_data = self._get_x_data()
-        sel_cols = self._data["sel_cols"]
-        headers = self._data["headers"]
+        headers = self._info["headers"]
+        indices = self._cached_indices
         split = self._split_var.get()
-
-        # X軸列はYから除外
-        x_col = headers.index(self._x_var.get()) if self._x_var.get() in headers else None
-        y_cols = [c for c in sel_cols if c != x_col]
-        if not y_cols:
-            y_cols = sel_cols  # X専用にしてしまった場合は全列表示
-
         n = len(y_cols)
-        if n == 0:
-            return
 
-        # x_data から None を除いた有効インデックス
-        x_arr = x_data
-        n_pts = len(x_arr)
+        # X軸データ
+        if x_col is None:
+            x_arr = [i + 1 for i in indices]
+            x_label = "行番号"
+        else:
+            x_arr = self._cached[x_col]
+            x_label = headers[x_col]
 
-        fig_h = max(4.0, 1.8 * n) if split else 4.5
+        fig_h = max(4.0, 1.6 * n) if split else 4.5
         fig, axes = self._plt.subplots(
             n if split else 1, 1,
-            figsize=(10, fig_h),
-            sharex=True if split else False,
-            squeeze=False
+            figsize=(9, fig_h),
+            sharex=True,
+            squeeze=False,
         )
-        fig.subplots_adjust(hspace=0.08 if split else 0.3,
-                            left=0.08, right=0.97, top=0.93, bottom=0.08)
-
+        fig.subplots_adjust(
+            hspace=0.06 if split else 0.25,
+            left=0.10, right=0.97,
+            top=0.94, bottom=0.07,
+        )
         colors = self._plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
         for i, col in enumerate(y_cols):
             ax = axes[i][0] if split else axes[0][0]
-            y_raw = self._data["cols"][col]
-            # None を nan に変換
-            import math
-            y_arr = [v if v is not None else math.nan for v in y_raw]
+            y_arr = self._cached[col]
             label = headers[col]
             color = colors[i % len(colors)]
             ax.plot(x_arr, y_arr, linewidth=0.8, color=color,
@@ -1261,22 +1304,17 @@ class PlotWindow:
                 ax.set_ylabel(label, fontsize=8, labelpad=2)
                 ax.tick_params(labelsize=7)
                 ax.grid(True, linewidth=0.4, alpha=0.5)
-            if i == 0 and not split:
-                ax.set_title(", ".join(headers[c] for c in y_cols), fontsize=9)
 
         if not split:
             ax = axes[0][0]
-            ax.legend(fontsize=8, loc="best")
+            if n <= 8:
+                ax.legend(fontsize=7, loc="best")
             ax.set_xlabel(x_label, fontsize=8)
             ax.grid(True, linewidth=0.4, alpha=0.5)
             ax.tick_params(labelsize=7)
         else:
             axes[-1][0].set_xlabel(x_label, fontsize=8)
             axes[-1][0].tick_params(labelsize=7)
-
-        if self._data["sampled"]:
-            fig.text(0.99, 0.005, f"サンプリング: {n_pts:,}pts / {self._data['total_rows']:,}行",
-                     ha="right", va="bottom", fontsize=7, color="#888")
 
         canvas = self._FigureCanvasTkAgg(fig, master=self._fig_frame)
         canvas.draw()
@@ -1432,11 +1470,11 @@ class App:
         g = self._current_grid()
         if not g:
             return
-        data = g.get_plot_data()
-        if data is None:
+        info = g.get_plot_info()
+        if info is None:
             messagebox.showinfo("グラフ", "列を選択してからグラフボタンを押してください。")
             return
-        PlotWindow(self.root, data)
+        PlotWindow(self.root, info)
 
     def _do_search(self, direction):
         g = self._current_grid()
