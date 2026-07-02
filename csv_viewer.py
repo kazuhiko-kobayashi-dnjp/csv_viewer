@@ -134,6 +134,10 @@ class Grid(ttk.Frame):
         self._tip_win = None     # ツールチップ Toplevel
         self._tip_col = -1       # 現在表示中のツールチップ列
 
+        self._plot_x_col = None  # X軸列インデックス(None=行番号)
+        self._plot_y_cols = []   # Y軸列インデックスリスト
+        self.on_plot_axes_changed = None  # App側コールバック
+
         self._build_ui()
         self._setup_dnd()
 
@@ -182,6 +186,7 @@ class Grid(ttk.Frame):
         cv.bind("<Control-A>",      lambda e: self._select_all())
         cv.bind("<Motion>",         self._on_motion)
         cv.bind("<Leave>",          lambda e: self._hide_tooltip())
+        cv.bind("<Button-3>",       self._on_right_click)
 
     def _setup_dnd(self):
         try:
@@ -227,6 +232,8 @@ class Grid(ttk.Frame):
         self._x_off = 0
         self._sel = None
         self._hsel = None
+        self._plot_x_col = None
+        self._plot_y_cols = []
 
         self._set_status(f"{path}  ({len(headers)} cols)  索引中…")
         self._start_indexing(path, enc, len(header_line.encode(enc)))
@@ -488,6 +495,49 @@ class Grid(ttk.Frame):
         self._dragging = None
         self._resize_col = None
 
+    def _on_right_click(self, event):
+        if not self._headers:
+            return
+        # ヘッダ行のみ対象
+        if event.y >= self._header_rows * ROW_H:
+            return
+        c = self._col_at_x(event.x)
+        if c is None:
+            return
+        col_name = self._headers[c]
+        menu = tk.Menu(self._canvas, tearoff=0)
+        menu.add_command(
+            label=f"X軸に設定: {col_name}",
+            command=lambda: self._set_plot_x(c))
+        menu.add_command(
+            label=f"Y軸に追加: {col_name}",
+            command=lambda: self._add_plot_y(c))
+        menu.add_separator()
+        menu.add_command(label="Y軸をリセット", command=self._reset_plot_y)
+        menu.add_command(label="X軸をリセット (行番号)", command=self._reset_plot_x)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_plot_x(self, col):
+        self._plot_x_col = col
+        if self.on_plot_axes_changed:
+            self.on_plot_axes_changed()
+
+    def _add_plot_y(self, col):
+        if col not in self._plot_y_cols:
+            self._plot_y_cols.append(col)
+        if self.on_plot_axes_changed:
+            self.on_plot_axes_changed()
+
+    def _reset_plot_y(self):
+        self._plot_y_cols = []
+        if self.on_plot_axes_changed:
+            self.on_plot_axes_changed()
+
+    def _reset_plot_x(self):
+        self._plot_x_col = None
+        if self.on_plot_axes_changed:
+            self.on_plot_axes_changed()
+
     def _on_motion(self, event):
         if not self._headers:
             return
@@ -577,28 +627,15 @@ class Grid(ttk.Frame):
         self.clipboard_append(text)
 
     def get_plot_info(self):
-        """グラフウィンドウ起動に必要な情報を返す（データは読まない）。
-        戻り値: {
-            'headers': [全列名],
-            'sel_cols': [選択列インデックス],
-            'total_rows': int,
-            'filepath': str, 'encoding': str, 'offsets': list,
-        }
-        """
+        """グラフウィンドウ起動に必要な情報を返す（データは読まない）。"""
         if not self._headers or not self._total_rows:
             return None
-        if self._hsel is not None:
-            c0, c1 = min(self._hsel), max(self._hsel)
-            sel_cols = list(range(c0, c1 + 1))
-        elif self._sel is not None:
-            _, c0, _, c1 = self._sel
-            c0, c1 = min(c0, c1), max(c0, c1)
-            sel_cols = list(range(c0, c1 + 1))
-        else:
+        if not self._plot_y_cols:
             return None
         return {
             "headers": self._headers,
-            "sel_cols": sel_cols,
+            "x_col": self._plot_x_col,   # None = 行番号
+            "y_cols": list(self._plot_y_cols),
             "total_rows": self._total_rows,
             "filepath": self._filepath,
             "encoding": self._encoding,
@@ -1129,88 +1166,38 @@ class PlotWindow:
             return
 
         headers = self._info["headers"]
-        sel_cols = self._info["sel_cols"]
+        x_col = self._info["x_col"]
+        y_cols = self._info["y_cols"]
 
-        # ── 左ペイン: 軸選択 ──────────────────────────────────────
-        left = tk.Frame(self._win, width=220, bd=1, relief=tk.GROOVE)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
-        left.pack_propagate(False)
+        # ── 上部バー: Y軸分離チェックとステータス ──
+        top = tk.Frame(self._win)
+        top.pack(side=tk.TOP, fill=tk.X, padx=6, pady=3)
 
-        tk.Label(left, text="X軸 (1列)", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=6, pady=(6, 2))
-        self._x_lb = tk.Listbox(left, height=6, exportselection=False, font=FONT)
-        xsb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self._x_lb.yview)
-        self._x_lb.config(yscrollcommand=xsb.set)
-        self._x_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
-        xsb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+        tk.Checkbutton(top, text="Y軸を分離", variable=self._split_var,
+                       command=self._on_split_changed).pack(side=tk.LEFT)
 
-        tk.Label(left, text="Y軸 (複数選択可)", font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=6, pady=(8, 2))
-        self._y_lb = tk.Listbox(left, selectmode=tk.EXTENDED, exportselection=False, font=FONT)
-        ysb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self._y_lb.yview)
-        self._y_lb.config(yscrollcommand=ysb.set)
-        self._y_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
-        ysb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+        x_label = "(行番号)" if x_col is None else headers[x_col]
+        y_label = ", ".join(headers[c] for c in y_cols)
+        if len(y_label) > 80:
+            y_label = y_label[:77] + "…"
+        tk.Label(top, text=f"X: {x_label}  /  Y: {y_label}",
+                 fg="#444", font=FONT).pack(side=tk.LEFT, padx=12)
 
-        # リストに全列名を投入
-        self._x_lb.insert(tk.END, "(行番号)")
-        for h in headers:
-            self._x_lb.insert(tk.END, h)
-        self._x_lb.selection_set(0)  # デフォルト: 行番号
+        self._status_lbl = tk.Label(top, text="", fg="#888", font=FONT)
+        self._status_lbl.pack(side=tk.RIGHT, padx=8)
 
-        for h in headers:
-            self._y_lb.insert(tk.END, h)
-        # 選択列を初期選択
-        for c in sel_cols:
-            self._y_lb.selection_set(c)
-        if sel_cols:
-            self._y_lb.see(sel_cols[0])
-
-        # ── 下部コントロール ──────────────────────────────────────
-        btn_frame = tk.Frame(left)
-        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=6)
-
-        tk.Checkbutton(btn_frame, text="Y軸を分離", variable=self._split_var,
-                       command=self._on_split_changed).pack(anchor="w")
-
-        self._status_lbl = tk.Label(btn_frame, text="", fg="#666", font=("TkDefaultFont", 8),
-                                    wraplength=200, justify=tk.LEFT)
-        self._status_lbl.pack(anchor="w", pady=(2, 4))
-
-        tk.Button(btn_frame, text="描画", font=("TkDefaultFont", 10, "bold"),
-                  command=self._on_draw).pack(fill=tk.X)
-
-        # ── 右ペイン: グラフ ──────────────────────────────────────
+        # ── グラフ領域 ──
         self._fig_frame = tk.Frame(self._win)
-        self._fig_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._fig_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
-    def _get_selections(self):
-        """(x_col_or_None, [y_col_indices]) を返す。x_col_or_None=None は行番号。"""
-        xi = self._x_lb.curselection()
-        x_col = None if (not xi or xi[0] == 0) else xi[0] - 1  # 0番目=(行番号)
+        # 起動時に即読み込み・描画
+        self._load_and_draw(x_col, y_cols)
 
-        yi = self._y_lb.curselection()
-        y_cols = list(yi)  # Listbox は headers と同インデックス
-        return x_col, y_cols
-
-    def _on_draw(self):
-        x_col, y_cols = self._get_selections()
-        if not y_cols:
-            self._status_lbl.config(text="Y軸列を1つ以上選択してください")
-            return
-
-        # 必要な列セット
+    def _load_and_draw(self, x_col, y_cols):
         need_cols = set(y_cols)
         if x_col is not None:
             need_cols.add(x_col)
 
-        # キャッシュ有効チェック: 必要な列が全てキャッシュ済みか
-        if (self._cached is not None
-                and need_cols <= set(self._cached.keys())
-                and self._cached_indices is not None):
-            self._status_lbl.config(text="キャッシュ済みデータで描画")
-            self._draw(x_col, y_cols)
-            return
-
-        # ── ファイル読み込み ──
         total = self._info["total_rows"]
         sampled = total > self.MAX_ROWS
         if sampled:
@@ -1218,9 +1205,6 @@ class PlotWindow:
             indices = [int(i * step) for i in range(self.MAX_ROWS)]
         else:
             indices = list(range(total))
-
-        self._status_lbl.config(text="読み込み中…")
-        self._win.update_idletasks()
 
         import csv as _csv
         cols = {c: [] for c in need_cols}
@@ -1239,7 +1223,7 @@ class PlotWindow:
                         except (ValueError, OverflowError):
                             cols[c].append(float("nan"))
         except Exception as e:
-            self._status_lbl.config(text=f"読み込みエラー: {e}")
+            tk.Label(self._fig_frame, text=f"読み込みエラー: {e}", fg="red").pack()
             return
 
         self._cached = cols
@@ -1247,12 +1231,11 @@ class PlotWindow:
         n_pts = len(indices)
         msg = f"{n_pts:,} pts"
         if sampled:
-            msg += f"\n(全{total:,}行からサンプリング)"
+            msg += f"  (全{total:,}行からサンプリング)"
         self._status_lbl.config(text=msg)
         self._draw(x_col, y_cols)
 
     def _on_split_changed(self):
-        # キャッシュがあれば即再描画、なければ何もしない
         if self._cached is not None and self._cached_y_cols is not None:
             self._draw(self._cached_x_col, self._cached_y_cols)
 
@@ -1362,6 +1345,10 @@ class App:
         tk.Button(toolbar, text="▲", width=2, command=lambda: self._do_search(-1)).pack(side=tk.LEFT)
         tk.Button(toolbar, text="▼", width=2, command=lambda: self._do_search(1)).pack(side=tk.LEFT, padx=(0, 6))
 
+        self._axes_var = tk.StringVar(value="")
+        tk.Label(toolbar, textvariable=self._axes_var, anchor=tk.W,
+                 fg="#1a73e8", font=("TkDefaultFont", 8)).pack(side=tk.LEFT, padx=(12, 4))
+
         self._status = tk.StringVar(value="No file loaded")
         tk.Label(toolbar, textvariable=self._status, anchor=tk.W).pack(side=tk.LEFT, padx=8)
 
@@ -1390,6 +1377,7 @@ class App:
     def _new_tab(self, title="(empty)"):
         grid = Grid(self._nb, set_status=self._set_status,
                     open_in_new_tab=self.open_file_in_new_tab)
+        grid.on_plot_axes_changed = self._update_axes_label
         self._grids.append(grid)
         self._nb.add(grid, text=title)
         self._nb.select(grid)
@@ -1447,7 +1435,24 @@ class App:
                                  f"{grid._total_rows} rows × {len(grid._headers)} cols")
             else:
                 self._status.set("No file loaded")
+            self._update_axes_label()
             grid.after(10, grid.focus_grid)
+
+    def _update_axes_label(self):
+        grid = self._current_grid()
+        if grid is None or not grid._headers:
+            self._axes_var.set("")
+            return
+        x_col = grid._plot_x_col
+        y_cols = grid._plot_y_cols
+        if not y_cols:
+            self._axes_var.set("")
+            return
+        x_name = "(行番号)" if x_col is None else grid._headers[x_col]
+        y_names = ", ".join(grid._headers[c] for c in y_cols)
+        if len(y_names) > 60:
+            y_names = y_names[:57] + "…"
+        self._axes_var.set(f"X:{x_name}  Y:{y_names}")
 
     # ── ツールバー操作の委譲 ─────────────────────────────────────
     def _browse(self):
@@ -1472,7 +1477,9 @@ class App:
             return
         info = g.get_plot_info()
         if info is None:
-            messagebox.showinfo("グラフ", "列を選択してからグラフボタンを押してください。")
+            messagebox.showinfo("グラフ",
+                "ヘッダを右クリック →「Y軸に追加」で列を指定してからグラフボタンを押してください。\n"
+                "X軸は省略すると行番号になります。")
             return
         PlotWindow(self.root, info)
 
