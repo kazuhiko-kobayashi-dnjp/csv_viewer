@@ -576,6 +576,64 @@ class Grid(ttk.Frame):
         self.clipboard_clear()
         self.clipboard_append(text)
 
+    def get_plot_data(self, max_rows=50000):
+        """選択列のデータを返す。
+        戻り値: {
+            'headers': [全列名],
+            'sel_cols': [選択列インデックス],  # _sel or _hsel から
+            'cols': {col_idx: [float or None, ...]},  # 選択列のデータ
+            'total_rows': int,
+            'sampled': bool,  # max_rows でサンプリングしたか
+        }
+        """
+        if not self._headers or not self._total_rows:
+            return None
+        # 選択列を収集
+        if self._hsel is not None:
+            c0, c1 = min(self._hsel), max(self._hsel)
+            sel_cols = list(range(c0, c1 + 1))
+        elif self._sel is not None:
+            _, c0, _, c1 = self._sel
+            c0, c1 = min(c0, c1), max(c0, c1)
+            sel_cols = list(range(c0, c1 + 1))
+        else:
+            return None
+
+        total = self._total_rows
+        sampled = total > max_rows
+        if sampled:
+            step = total / max_rows
+            indices = [int(i * step) for i in range(max_rows)]
+        else:
+            indices = list(range(total))
+
+        cols = {c: [] for c in sel_cols}
+        path, enc, offsets = self._filepath, self._encoding, self._offsets
+        import csv as _csv
+        with open(path, "r", encoding=enc, newline="") as f:
+            for idx in indices:
+                f.seek(offsets[idx])
+                line = f.readline()
+                fields = next(_csv.reader([line])) if line else []
+                for c in sel_cols:
+                    raw = fields[c] if c < len(fields) else ""
+                    try:
+                        cols[c].append(float(raw))
+                    except (ValueError, OverflowError):
+                        cols[c].append(None)
+
+        return {
+            "headers": self._headers,
+            "sel_cols": sel_cols,
+            "cols": cols,
+            "total_rows": total,
+            "sampled": sampled,
+            "indices": indices,
+            "_filepath": self._filepath,
+            "_encoding": self._encoding,
+            "_offsets": self._offsets,
+        }
+
     # ── キーボード移動 ───────────────────────────────────────────
     def _move_sel(self, dr, dc, jump=False):
         if not self._headers or not self._total_rows:
@@ -1055,6 +1113,181 @@ class Grid(ttk.Frame):
             self._hsb.set(0, 1)
 
 
+class PlotWindow:
+    """グラフ表示ポップアップ。matplotlib を Tkinter に埋め込む。"""
+
+    MAX_ROWS = 50000  # サンプリング上限
+
+    def __init__(self, parent, data):
+        """
+        data: Grid.get_plot_data() の戻り値
+        """
+        self._data = data
+        self._win = tk.Toplevel(parent)
+        self._win.title("グラフ")
+        self._win.geometry("900x620")
+
+        self._x_var = tk.StringVar(value="(行番号)")
+        self._split_var = tk.BooleanVar(value=False)
+
+        self._build_ui()
+        self._plot()
+
+    def _build_ui(self):
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            import matplotlib.pyplot as plt
+            self._plt = plt
+            self._FigureCanvasTkAgg = FigureCanvasTkAgg
+            self._NavToolbar = NavigationToolbar2Tk
+        except ImportError:
+            tk.Label(self._win, text="matplotlib が必要です: pip install matplotlib",
+                     fg="red").pack(padx=20, pady=20)
+            return
+
+        # ── コントロールパネル ──
+        ctrl = tk.Frame(self._win)
+        ctrl.pack(side=tk.TOP, fill=tk.X, padx=6, pady=3)
+
+        headers = self._data["headers"]
+        x_choices = ["(行番号)"] + headers
+
+        tk.Label(ctrl, text="X軸:").pack(side=tk.LEFT)
+        self._x_cb = ttk.Combobox(ctrl, textvariable=self._x_var,
+                                  values=x_choices, width=30, state="readonly")
+        self._x_cb.pack(side=tk.LEFT, padx=(2, 12))
+        self._x_cb.bind("<<ComboboxSelected>>", lambda e: self._plot())
+
+        tk.Checkbutton(ctrl, text="Y軸を分離", variable=self._split_var,
+                       command=self._plot).pack(side=tk.LEFT, padx=4)
+
+        if self._data["sampled"]:
+            tk.Label(ctrl, text=f"※ {self._data['total_rows']:,}行 → {self.MAX_ROWS:,}行サンプリング",
+                     fg="#888").pack(side=tk.LEFT, padx=8)
+
+        # ── グラフ領域 ──
+        self._fig_frame = tk.Frame(self._win)
+        self._fig_frame.pack(fill=tk.BOTH, expand=True)
+        self._canvas_widget = None
+        self._toolbar_widget = None
+
+    def _get_x_data(self):
+        """X軸データを (label, list[float|None]) で返す。"""
+        choice = self._x_var.get()
+        indices = self._data["indices"]
+        if choice == "(行番号)":
+            return "行番号", [i + 1 for i in indices]
+        headers = self._data["headers"]
+        if choice not in headers:
+            return "行番号", [i + 1 for i in indices]
+        col = headers.index(choice)
+        # X列が sel_cols に含まれているかに関わらず読む
+        path = None
+        # sel_cols のデータがあれば使う
+        if col in self._data["cols"]:
+            return choice, self._data["cols"][col]
+        # なければ再読み込み（X列専用）
+        import csv as _csv
+        xdata = []
+        try:
+            with open(self._data["_filepath"], "r",
+                      encoding=self._data["_encoding"], newline="") as f:
+                offsets = self._data["_offsets"]
+                for idx in self._data["indices"]:
+                    f.seek(offsets[idx])
+                    line = f.readline()
+                    fields = next(_csv.reader([line])) if line else []
+                    raw = fields[col] if col < len(fields) else ""
+                    try:
+                        xdata.append(float(raw))
+                    except (ValueError, OverflowError):
+                        xdata.append(None)
+        except Exception:
+            xdata = [i + 1 for i in self._data["indices"]]
+        return choice, xdata
+
+    def _plot(self):
+        import matplotlib
+        matplotlib.use("TkAgg")
+
+        # 既存ウィジェット破棄
+        if self._canvas_widget:
+            self._canvas_widget.get_tk_widget().destroy()
+        if self._toolbar_widget:
+            self._toolbar_widget.destroy()
+
+        x_label, x_data = self._get_x_data()
+        sel_cols = self._data["sel_cols"]
+        headers = self._data["headers"]
+        split = self._split_var.get()
+
+        # X軸列はYから除外
+        x_col = headers.index(self._x_var.get()) if self._x_var.get() in headers else None
+        y_cols = [c for c in sel_cols if c != x_col]
+        if not y_cols:
+            y_cols = sel_cols  # X専用にしてしまった場合は全列表示
+
+        n = len(y_cols)
+        if n == 0:
+            return
+
+        # x_data から None を除いた有効インデックス
+        x_arr = x_data
+        n_pts = len(x_arr)
+
+        fig_h = max(4.0, 1.8 * n) if split else 4.5
+        fig, axes = self._plt.subplots(
+            n if split else 1, 1,
+            figsize=(10, fig_h),
+            sharex=True if split else False,
+            squeeze=False
+        )
+        fig.subplots_adjust(hspace=0.08 if split else 0.3,
+                            left=0.08, right=0.97, top=0.93, bottom=0.08)
+
+        colors = self._plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+        for i, col in enumerate(y_cols):
+            ax = axes[i][0] if split else axes[0][0]
+            y_raw = self._data["cols"][col]
+            # None を nan に変換
+            import math
+            y_arr = [v if v is not None else math.nan for v in y_raw]
+            label = headers[col]
+            color = colors[i % len(colors)]
+            ax.plot(x_arr, y_arr, linewidth=0.8, color=color,
+                    label=label if not split else None)
+            if split:
+                ax.set_ylabel(label, fontsize=8, labelpad=2)
+                ax.tick_params(labelsize=7)
+                ax.grid(True, linewidth=0.4, alpha=0.5)
+            if i == 0 and not split:
+                ax.set_title(", ".join(headers[c] for c in y_cols), fontsize=9)
+
+        if not split:
+            ax = axes[0][0]
+            ax.legend(fontsize=8, loc="best")
+            ax.set_xlabel(x_label, fontsize=8)
+            ax.grid(True, linewidth=0.4, alpha=0.5)
+            ax.tick_params(labelsize=7)
+        else:
+            axes[-1][0].set_xlabel(x_label, fontsize=8)
+            axes[-1][0].tick_params(labelsize=7)
+
+        if self._data["sampled"]:
+            fig.text(0.99, 0.005, f"サンプリング: {n_pts:,}pts / {self._data['total_rows']:,}行",
+                     ha="right", va="bottom", fontsize=7, color="#888")
+
+        canvas = self._FigureCanvasTkAgg(fig, master=self._fig_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar = self._NavToolbar(canvas, self._fig_frame)
+        toolbar.update()
+        self._canvas_widget = canvas
+        self._toolbar_widget = toolbar
+        self._plt.close(fig)
+
+
 class App:
     """ツールバー + 複数タブ(Notebook)を管理するアプリ本体。"""
 
@@ -1080,6 +1313,7 @@ class App:
         tk.Button(toolbar, text="Copy", command=self._copy).pack(side=tk.LEFT, padx=2, pady=2)
         tk.Button(toolbar, text="Copy+ラベル", command=self._copy_labels).pack(side=tk.LEFT, padx=2, pady=2)
         tk.Button(toolbar, text="タブを閉じる", command=self._close_tab).pack(side=tk.LEFT, padx=2, pady=2)
+        tk.Button(toolbar, text="グラフ", command=self._open_plot).pack(side=tk.LEFT, padx=(8, 2), pady=2)
 
         tk.Label(toolbar, text="検索:").pack(side=tk.LEFT, padx=(12, 2))
         self._search_var = tk.StringVar()
@@ -1193,6 +1427,16 @@ class App:
         g = self._current_grid()
         if g:
             g.copy_with_labels()
+
+    def _open_plot(self):
+        g = self._current_grid()
+        if not g:
+            return
+        data = g.get_plot_data()
+        if data is None:
+            messagebox.showinfo("グラフ", "列を選択してからグラフボタンを押してください。")
+            return
+        PlotWindow(self.root, data)
 
     def _do_search(self, direction):
         g = self._current_grid()

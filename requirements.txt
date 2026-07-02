@@ -1,5 +1,9 @@
 # 標準ライブラリ tkinter を使用（多くの環境に同梱）。
 # Linux で未導入の場合: sudo apt install python3-tk
 #
+# グラフ機能に必要
+matplotlib
+numpy
+#
 # 任意: ドラッグ&ドロップ対応（主に Windows）
 tkinterdnd2
