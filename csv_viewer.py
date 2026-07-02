@@ -127,6 +127,13 @@ class Grid(ttk.Frame):
         self._search_result = None
         self._search_term = ""
 
+        self._resize_col = None   # リサイズ中の列インデックス
+        self._resize_x0 = 0      # ドラッグ開始X
+        self._resize_w0 = 0      # ドラッグ開始時の列幅
+
+        self._tip_win = None     # ツールチップ Toplevel
+        self._tip_col = -1       # 現在表示中のツールチップ列
+
         self._build_ui()
         self._setup_dnd()
 
@@ -173,6 +180,8 @@ class Grid(ttk.Frame):
         cv.bind("<Control-Shift-End>",  lambda _e: self._extend_corner(self._total_rows - 1, len(self._headers) - 1))
         cv.bind("<Control-a>",      lambda e: self._select_all())
         cv.bind("<Control-A>",      lambda e: self._select_all())
+        cv.bind("<Motion>",         self._on_motion)
+        cv.bind("<Leave>",          lambda e: self._hide_tooltip())
 
     def _setup_dnd(self):
         try:
@@ -396,11 +405,28 @@ class Grid(ttk.Frame):
             return None
         return int(r)
 
+    # ── リサイズ境界検出 ─────────────────────────────────────────
+    def _resize_col_at(self, px):
+        """px 付近（±4px）にある列境界の列インデックスを返す。なければ None。"""
+        SNAP = 4
+        for i, (cx, cw) in enumerate(zip(self._col_x, self._col_w)):
+            rx = ROWNUM_W + cx + cw - self._x_off
+            if abs(px - rx) <= SNAP:
+                return i
+        return None
+
     # ── 選択 ─────────────────────────────────────────────────────
     def _on_press(self, event):
         self._canvas.focus_set()
-        if event.y < self._header_rows * ROW_H:
-            # ヘッダ(ラベル)選択
+        self._hide_tooltip()
+        if event.y < self._header_rows * ROW_H and self._headers:
+            rc = self._resize_col_at(event.x)
+            if rc is not None:
+                self._dragging = "resize_col"
+                self._resize_col = rc
+                self._resize_x0 = event.x
+                self._resize_w0 = self._col_w[rc]
+                return
             c = self._col_at_x(event.x)
             if c is None:
                 return
@@ -420,6 +446,18 @@ class Grid(ttk.Frame):
         self._redraw()
 
     def _on_drag(self, event):
+        if self._dragging == "resize_col":
+            new_w = max(COL_MIN_W, self._resize_w0 + event.x - self._resize_x0)
+            self._col_w[self._resize_col] = new_w
+            # col_x を再計算
+            x = 0
+            for i in range(len(self._col_x)):
+                self._col_x[i] = x
+                x += self._col_w[i]
+            self._total_w = x
+            self._clamp_scroll()
+            self._redraw()
+            return
         if self._dragging == "header":
             cx = max(ROWNUM_W, min(event.x, self._canvas.winfo_width() - 1))
             c = self._col_at_x(cx)
@@ -448,6 +486,52 @@ class Grid(ttk.Frame):
 
     def _on_release(self, event):
         self._dragging = None
+        self._resize_col = None
+
+    def _on_motion(self, event):
+        if not self._headers:
+            return
+        # リサイズカーソル切り替え
+        if event.y < self._header_rows * ROW_H:
+            if self._resize_col_at(event.x) is not None:
+                self._canvas.config(cursor="sb_h_double_arrow")
+            else:
+                self._canvas.config(cursor="")
+            # ツールチップ
+            c = self._col_at_x(event.x)
+            if c is not None:
+                self._show_tooltip(event, c)
+            else:
+                self._hide_tooltip()
+        else:
+            self._canvas.config(cursor="")
+            self._hide_tooltip()
+
+    def _show_tooltip(self, event, col):
+        if self._tip_col == col:
+            # 位置だけ更新
+            if self._tip_win:
+                x = self._canvas.winfo_rootx() + event.x + 12
+                y = self._canvas.winfo_rooty() + event.y + 16
+                self._tip_win.geometry(f"+{x}+{y}")
+            return
+        self._hide_tooltip()
+        self._tip_col = col
+        label = self._headers[col]
+        x = self._canvas.winfo_rootx() + event.x + 12
+        y = self._canvas.winfo_rooty() + event.y + 16
+        win = tk.Toplevel(self._canvas)
+        win.wm_overrideredirect(True)
+        win.geometry(f"+{x}+{y}")
+        tk.Label(win, text=label, background="#ffffe0", relief="solid",
+                 borderwidth=1, font=FONT, padx=4, pady=2).pack()
+        self._tip_win = win
+
+    def _hide_tooltip(self):
+        if self._tip_win:
+            self._tip_win.destroy()
+            self._tip_win = None
+        self._tip_col = -1
 
     def _norm_sel(self):
         r0, c0, r1, c1 = self._sel
