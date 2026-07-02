@@ -24,7 +24,6 @@ ROWNUM_W = 70         # 行番号列の幅(px)
 COL_MIN_W = 60
 COL_MAX_W = 280
 CHAR_W = 7            # 文字幅見積り(px)
-HEADER_ROWS = 2       # 上段:接頭語 下段:個別名
 FONT = ("TkDefaultFont", 9)
 CACHE_LIMIT = 4000    # 行キャッシュ上限
 
@@ -38,11 +37,8 @@ def _make_tk():
 
 
 def split_label(name):
-    """ラベルを (接頭語, 個別名) に分割。最初のドットで区切る。"""
-    if "." in name:
-        prefix, indiv = name.split(".", 1)
-        return prefix, indiv
-    return "", name
+    """ラベルをドットで全階層分割してリストで返す。"""
+    return name.split(".")
 
 
 def to_local_path(path):
@@ -104,8 +100,8 @@ class Grid(ttk.Frame):
         self._filepath = None
         self._encoding = "utf-8"
         self._headers = []
-        self._prefixes = []
-        self._indivs = []
+        self._parts = []      # 各列: ドット分割された階層リスト
+        self._header_rows = 1
         self._col_w = []
         self._col_x = []
         self._total_w = 0
@@ -156,14 +152,27 @@ class Grid(ttk.Frame):
         cv.bind("<ButtonRelease-1>", self._on_release)
         cv.bind("<Control-c>", lambda e: self.copy_selection())
         cv.bind("<Control-C>", lambda e: self.copy_selection())
-        # 矢印: 単独移動 / Shift: 範囲拡張 / Ctrl+Shift: 端まで拡張
+        # 矢印: 単独移動 / Ctrl: 端まで移動 / Shift: 範囲拡張 / Ctrl+Shift: 端まで拡張
         for key, dr, dc in (("Up", -1, 0), ("Down", 1, 0),
                             ("Left", 0, -1), ("Right", 0, 1)):
-            cv.bind(f"<{key}>", lambda e, a=dr, b=dc: self._move_sel(a, b))
-            cv.bind(f"<Shift-{key}>", lambda e, a=dr, b=dc: self._extend_sel(a, b, False))
+            cv.bind(f"<{key}>",               lambda e, a=dr, b=dc: self._move_sel(a, b, False))
+            cv.bind(f"<Control-{key}>",       lambda e, a=dr, b=dc: self._move_sel(a, b, True))
+            cv.bind(f"<Shift-{key}>",         lambda e, a=dr, b=dc: self._extend_sel(a, b, False))
             cv.bind(f"<Control-Shift-{key}>", lambda e, a=dr, b=dc: self._extend_sel(a, b, True))
-        cv.bind("<Prior>", lambda e: self._page(-1))
-        cv.bind("<Next>", lambda e: self._page(1))
+        cv.bind("<Prior>",          lambda e: self._page(-1))
+        cv.bind("<Next>",           lambda e: self._page(1))
+        cv.bind("<Shift-Prior>",    lambda e: self._page_extend(-1))
+        cv.bind("<Shift-Next>",     lambda e: self._page_extend(1))
+        cv.bind("<Home>",           lambda e: self._move_home())
+        cv.bind("<End>",            lambda e: self._move_end())
+        cv.bind("<Shift-Home>",     lambda e: self._extend_home())
+        cv.bind("<Shift-End>",      lambda e: self._extend_end())
+        cv.bind("<Control-Home>",       lambda _e: self._move_corner(0, 0))
+        cv.bind("<Control-End>",        lambda _e: self._move_corner(self._total_rows - 1, len(self._headers) - 1))
+        cv.bind("<Control-Shift-Home>", lambda _e: self._extend_corner(0, 0))
+        cv.bind("<Control-Shift-End>",  lambda _e: self._extend_corner(self._total_rows - 1, len(self._headers) - 1))
+        cv.bind("<Control-a>",      lambda e: self._select_all())
+        cv.bind("<Control-A>",      lambda e: self._select_all())
 
     def _setup_dnd(self):
         try:
@@ -197,12 +206,8 @@ class Grid(ttk.Frame):
         self._filepath = path
         self._encoding = enc
         self._headers = headers
-        self._prefixes = []
-        self._indivs = []
-        for h in headers:
-            p, i = split_label(h)
-            self._prefixes.append(p)
-            self._indivs.append(i)
+        self._parts = [split_label(h) for h in headers]
+        self._header_rows = max(len(p) for p in self._parts) if self._parts else 1
         self._compute_columns()
 
         self._row_cache.clear()
@@ -240,8 +245,8 @@ class Grid(ttk.Frame):
         self._col_w = []
         self._col_x = []
         x = 0
-        for i in range(len(self._headers)):
-            label_len = max(len(self._prefixes[i]), len(self._indivs[i]))
+        for parts in self._parts:
+            label_len = max(len(s) for s in parts)
             w = max(COL_MIN_W, min(COL_MAX_W, label_len * CHAR_W + 12))
             self._col_w.append(w)
             self._col_x.append(x)
@@ -316,7 +321,7 @@ class Grid(ttk.Frame):
     # ── スクロール ───────────────────────────────────────────────
     def _visible_data_rows(self):
         h = self._canvas.winfo_height()
-        return max(1, (h - HEADER_ROWS * ROW_H) // ROW_H)
+        return max(1, (h - self._header_rows * ROW_H) // ROW_H)
 
     def _on_vscroll(self, *args):
         if not self._total_rows:
@@ -383,7 +388,7 @@ class Grid(ttk.Frame):
         return None
 
     def _row_at_y(self, py):
-        top = HEADER_ROWS * ROW_H
+        top = self._header_rows * ROW_H
         if py < top:
             return None
         r = self._first_row + (py - top) // ROW_H
@@ -394,7 +399,7 @@ class Grid(ttk.Frame):
     # ── 選択 ─────────────────────────────────────────────────────
     def _on_press(self, event):
         self._canvas.focus_set()
-        if event.y < HEADER_ROWS * ROW_H:
+        if event.y < self._header_rows * ROW_H:
             # ヘッダ(ラベル)選択
             c = self._col_at_x(event.x)
             if c is None:
@@ -427,11 +432,11 @@ class Grid(ttk.Frame):
             return
         if event.y > self._canvas.winfo_height() - ROW_H:
             self._first_row += 1
-        elif event.y < HEADER_ROWS * ROW_H:
+        elif event.y < self._header_rows * ROW_H:
             self._first_row -= 1
         self._clamp_scroll()
         cx = max(ROWNUM_W, min(event.x, self._canvas.winfo_width() - 1))
-        cy = max(HEADER_ROWS * ROW_H, min(event.y, self._canvas.winfo_height() - 1))
+        cy = max(self._header_rows * ROW_H, min(event.y, self._canvas.winfo_height() - 1))
         c = self._col_at_x(cx)
         r = self._row_at_y(cy)
         if c is None:
@@ -488,15 +493,21 @@ class Grid(ttk.Frame):
         self.clipboard_append(text)
 
     # ── キーボード移動 ───────────────────────────────────────────
-    def _move_sel(self, dr, dc):
+    def _move_sel(self, dr, dc, jump=False):
         if not self._headers or not self._total_rows:
             return "break"
         if self._sel is None:
             r, c = self._first_row, 0
         else:
             _, _, r, c = self._sel
-        r = max(0, min(r + dr, self._total_rows - 1))
-        c = max(0, min(c + dc, len(self._headers) - 1))
+        if jump:
+            if dr < 0: r = 0
+            elif dr > 0: r = self._total_rows - 1
+            if dc < 0: c = 0
+            elif dc > 0: c = len(self._headers) - 1
+        else:
+            r = max(0, min(r + dr, self._total_rows - 1))
+            c = max(0, min(c + dc, len(self._headers) - 1))
         self._sel = (r, c, r, c)
         self._hsel = None
         self._ensure_visible(r, c)
@@ -504,21 +515,17 @@ class Grid(ttk.Frame):
         self._redraw()
         return "break"
 
-    def _extend_sel(self, dr, dc, jump):
+    def _extend_sel(self, dr, dc, jump=False):
         if not self._headers or not self._total_rows:
             return "break"
         if self._sel is None:
             self._sel = (self._first_row, 0, self._first_row, 0)
         r0, c0, r1, c1 = self._sel
         if jump:
-            if dr < 0:
-                r1 = 0
-            elif dr > 0:
-                r1 = self._total_rows - 1
-            if dc < 0:
-                c1 = 0
-            elif dc > 0:
-                c1 = len(self._headers) - 1
+            if dr < 0: r1 = 0
+            elif dr > 0: r1 = self._total_rows - 1
+            if dc < 0: c1 = 0
+            elif dc > 0: c1 = len(self._headers) - 1
         else:
             r1 = max(0, min(r1 + dr, self._total_rows - 1))
             c1 = max(0, min(c1 + dc, len(self._headers) - 1))
@@ -529,8 +536,112 @@ class Grid(ttk.Frame):
         return "break"
 
     def _page(self, direction):
-        self._first_row += direction * self._visible_data_rows()
+        n = self._visible_data_rows()
+        if self._sel:
+            _, c0, _, c1 = self._sel
+            r = max(0, min(self._sel[2] + direction * n, self._total_rows - 1))
+            self._sel = (r, c0, r, c1)
+            self._ensure_visible(r, c1)
+            self._update_cell_status()
+        else:
+            self._first_row += direction * n
         self._clamp_scroll()
+        self._redraw()
+        return "break"
+
+    def _page_extend(self, direction):
+        if not self._headers or not self._total_rows:
+            return "break"
+        if self._sel is None:
+            self._sel = (self._first_row, 0, self._first_row, 0)
+        r0, c0, r1, c1 = self._sel
+        n = self._visible_data_rows()
+        r1 = max(0, min(r1 + direction * n, self._total_rows - 1))
+        self._sel = (r0, c0, r1, c1)
+        self._hsel = None
+        self._ensure_visible(r1, c1)
+        self._redraw()
+        return "break"
+
+    def _move_home(self):
+        if not self._headers or not self._total_rows:
+            return "break"
+        r = self._sel[2] if self._sel else self._first_row
+        self._sel = (r, 0, r, 0)
+        self._hsel = None
+        self._ensure_visible(r, 0)
+        self._update_cell_status()
+        self._redraw()
+        return "break"
+
+    def _move_end(self):
+        if not self._headers or not self._total_rows:
+            return "break"
+        r = self._sel[2] if self._sel else self._first_row
+        c = len(self._headers) - 1
+        self._sel = (r, c, r, c)
+        self._hsel = None
+        self._ensure_visible(r, c)
+        self._update_cell_status()
+        self._redraw()
+        return "break"
+
+    def _extend_home(self):
+        if not self._headers or not self._total_rows:
+            return "break"
+        if self._sel is None:
+            self._sel = (self._first_row, 0, self._first_row, 0)
+        r0, c0, r1, _ = self._sel
+        self._sel = (r0, c0, r1, 0)
+        self._hsel = None
+        self._ensure_visible(r1, 0)
+        self._redraw()
+        return "break"
+
+    def _extend_end(self):
+        if not self._headers or not self._total_rows:
+            return "break"
+        if self._sel is None:
+            self._sel = (self._first_row, 0, self._first_row, 0)
+        r0, c0, r1, _ = self._sel
+        c = len(self._headers) - 1
+        self._sel = (r0, c0, r1, c)
+        self._hsel = None
+        self._ensure_visible(r1, c)
+        self._redraw()
+        return "break"
+
+    def _select_all(self):
+        if not self._headers or not self._total_rows:
+            return "break"
+        self._sel = (0, 0, self._total_rows - 1, len(self._headers) - 1)
+        self._hsel = None
+        self._redraw()
+        return "break"
+
+    def _move_corner(self, r, c):
+        if not self._headers or not self._total_rows:
+            return "break"
+        r = max(0, min(r, self._total_rows - 1))
+        c = max(0, min(c, len(self._headers) - 1))
+        self._sel = (r, c, r, c)
+        self._hsel = None
+        self._ensure_visible(r, c)
+        self._update_cell_status()
+        self._redraw()
+        return "break"
+
+    def _extend_corner(self, r, c):
+        if not self._headers or not self._total_rows:
+            return "break"
+        if self._sel is None:
+            self._sel = (self._first_row, 0, self._first_row, 0)
+        r0, c0 = self._sel[0], self._sel[1]
+        r = max(0, min(r, self._total_rows - 1))
+        c = max(0, min(c, len(self._headers) - 1))
+        self._sel = (r0, c0, r, c)
+        self._hsel = None
+        self._ensure_visible(r, c)
         self._redraw()
         return "break"
 
@@ -654,7 +765,7 @@ class Grid(ttk.Frame):
         W = cv.winfo_width()
         H = cv.winfo_height()
         n_vis = self._visible_data_rows()
-        header_h = HEADER_ROWS * ROW_H
+        header_h = self._header_rows * ROW_H
         data_top = header_h
 
         first_col, last_col = self._visible_col_range(W)
@@ -672,6 +783,9 @@ class Grid(ttk.Frame):
             for c in range(first_col, last_col + 1):
                 x = ROWNUM_W + self._col_x[c] - self._x_off
                 val = row[c] if row and c < len(row) else ""
+                max_chars = max(1, (self._col_w[c] - 8) // CHAR_W)
+                if len(val) > max_chars:
+                    val = val[:max_chars - 1] + "…"
                 cv.create_text(x + 4, y + ROW_H // 2, anchor="w", text=val,
                                font=FONT, fill="black")
             cv.create_line(0, y, W, y, fill="#e8e8e8")
@@ -721,54 +835,81 @@ class Grid(ttk.Frame):
             cv.create_line(0, y, ROWNUM_W, y, fill="#e0e0e0")
         cv.create_line(ROWNUM_W, data_top, ROWNUM_W, H, fill="#a0a0a0")
 
+    def _padded_parts(self, col):
+        """列の parts を _header_rows 段に上詰めパディング（空文字）して返す。
+        最下段が個別名、上段が接頭語になるよう下詰めにする。"""
+        p = self._parts[col]
+        pad = self._header_rows - len(p)
+        return [""] * pad + list(p)
+
     def _draw_header(self, cv, first_col, last_col, W):
-        cv.create_rectangle(ROWNUM_W, 0, W, HEADER_ROWS * ROW_H,
-                            fill="#d9d9d9", outline="")
+        hr = self._header_rows
+        header_h = hr * ROW_H
+        cv.create_rectangle(ROWNUM_W, 0, W, header_h, fill="#d9d9d9", outline="")
         hsel0 = hsel1 = None
         if self._hsel is not None:
             hsel0, hsel1 = min(self._hsel), max(self._hsel)
-        # 下段: 個別名
-        for c in range(first_col, last_col + 1):
-            x0 = ROWNUM_W + self._col_x[c] - self._x_off
-            x1 = x0 + self._col_w[c]
-            selected = hsel0 is not None and hsel0 <= c <= hsel1
-            cv.create_rectangle(x0, ROW_H, x1, HEADER_ROWS * ROW_H,
-                                fill="#9cc4f4" if selected else "#e9e9e9",
-                                outline="#b0b0b0")
-            cv.create_text((x0 + x1) // 2, ROW_H + ROW_H // 2,
-                           text=self._indivs[c], font=FONT, fill="black")
-        # 上段: 接頭語を連続する同一接頭語でまとめる
-        c = first_col
-        while c <= last_col:
-            p = self._prefixes[c]
-            g_end = c
-            while g_end + 1 <= last_col and self._prefixes[g_end + 1] == p:
-                g_end += 1
-            x0 = ROWNUM_W + self._col_x[c] - self._x_off
-            x1 = ROWNUM_W + self._col_x[g_end] + self._col_w[g_end] - self._x_off
-            x0c = max(x0, ROWNUM_W)
-            selected = hsel0 is not None and not (g_end < hsel0 or c > hsel1)
-            if selected:
-                fill = "#7fb0ef"
-            elif p:
-                fill = "#cfd8e8"
+
+        # 各列の下詰めパディング済み parts をキャッシュ
+        padded = [self._padded_parts(c) for c in range(len(self._parts))]
+
+        for row in range(hr):
+            y0 = row * ROW_H
+            y1 = y0 + ROW_H
+            is_last = (row == hr - 1)
+            if is_last:
+                bg_default = "#e9e9e9"
+                bg_group   = "#e9e9e9"
+                text_color = "black"
             else:
-                fill = "#d9d9d9"
-            cv.create_rectangle(x0, 0, x1, ROW_H, fill=fill, outline="#b0b0b0")
-            if p:
-                cv.create_text((x0c + x1) // 2, ROW_H // 2, text=p,
-                               font=FONT, fill="#103060")
-            c = g_end + 1
+                depth_ratio = row / max(hr - 1, 1)
+                r_val = int(0xcf - depth_ratio * 0x20)
+                b_val = int(0xe8 - depth_ratio * 0x30)
+                bg_group = f"#{r_val:02x}d8{b_val:02x}"
+                bg_default = "#d9d9d9"
+                text_color = "#103060"
+
+            c = first_col
+            while c <= last_col:
+                # row段目のテキスト（下詰め済み）
+                label = padded[c][row]
+
+                # 同じグループ（この段より上の全段が一致 かつ この段も一致）をまとめる
+                key = tuple(padded[c][:row + 1])
+                g_end = c
+                while g_end + 1 <= last_col and tuple(padded[g_end + 1][:row + 1]) == key:
+                    g_end += 1
+
+                x0 = ROWNUM_W + self._col_x[c] - self._x_off
+                x1 = ROWNUM_W + self._col_x[g_end] + self._col_w[g_end] - self._x_off
+                x0c = max(x0, ROWNUM_W)
+                selected = hsel0 is not None and not (g_end < hsel0 or c > hsel1)
+
+                if selected:
+                    fill = "#9cc4f4" if is_last else "#7fb0ef"
+                elif label and not is_last:
+                    fill = bg_group
+                else:
+                    fill = bg_default
+
+                cv.create_rectangle(x0, y0, x1, y1, fill=fill, outline="#b0b0b0")
+                if label:
+                    cell_w = max(x1, ROWNUM_W) - x0c
+                    max_chars = max(1, (cell_w - 8) // CHAR_W)
+                    disp = label if len(label) <= max_chars else label[:max_chars - 1] + "…"
+                    cv.create_text((x0c + x1) // 2, y0 + ROW_H // 2,
+                                   text=disp, font=FONT, fill=text_color)
+                c = g_end + 1
+
         # ヘッダ選択の枠
         if hsel0 is not None and not (hsel1 < first_col or hsel0 > last_col):
             cc0 = max(hsel0, first_col)
             cc1 = min(hsel1, last_col)
             bx0 = ROWNUM_W + self._col_x[cc0] - self._x_off
             bx1 = ROWNUM_W + self._col_x[cc1] + self._col_w[cc1] - self._x_off
-            cv.create_rectangle(max(bx0, ROWNUM_W), 0, bx1, HEADER_ROWS * ROW_H,
+            cv.create_rectangle(max(bx0, ROWNUM_W), 0, bx1, header_h,
                                 outline="#1a73e8", width=2)
-        cv.create_line(ROWNUM_W, HEADER_ROWS * ROW_H, W, HEADER_ROWS * ROW_H,
-                       fill="#a0a0a0")
+        cv.create_line(ROWNUM_W, header_h, W, header_h, fill="#a0a0a0")
 
     def _draw_crosshair(self, cv, first_col, last_col, n_vis, data_top, W, H):
         # アクティブセル（選択の末尾）の行・列に薄い十字
